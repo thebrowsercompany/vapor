@@ -97,6 +97,30 @@ extension Response {
             }
         }
 
+        public var isStreaming: Bool {
+            if case .stream = storage {
+                return true
+            }
+            return false
+        }
+
+        public func withRewrittenStream(on eventLoop: EventLoop, using rewriter: @escaping @Sendable (BodyStreamResult) -> [BodyStreamResult]) -> Self {
+            guard case .stream(let bodyStream) = storage else {
+                return self
+            }
+
+            let originalStreamCallback = bodyStream.callback
+
+            let newCallback: @Sendable (BodyStreamWriter) -> () = { writer in
+                let rewriter = ResponseBodyRewriter(eventLoop: eventLoop, rewrite: rewriter, actualWriter: writer)
+                originalStreamCallback(rewriter)
+            }
+
+            var newBody = self
+            newBody.storage = .stream(.init(count: bodyStream.count, callback: newCallback))
+            return newBody
+        }
+
         public func collect(on eventLoop: EventLoop) -> EventLoopFuture<ByteBuffer?> {
             switch self.storage {
             case .stream(let stream):
@@ -277,5 +301,25 @@ private final class ResponseBodyCollector: BodyStreamWriter, AsyncBodyStreamWrit
         
         self.eventLoop.execute { self.write(result, promise: promise) }
         try await promise.futureResult.get()
+    }
+}
+
+
+private final class ResponseBodyRewriter: BodyStreamWriter, @unchecked Sendable {
+    let eventLoop: EventLoop
+    let rewrite: @Sendable (BodyStreamResult) -> [BodyStreamResult]
+    let actualWriter: BodyStreamWriter
+
+    init(eventLoop: EventLoop, rewrite: @escaping @Sendable (BodyStreamResult) -> [BodyStreamResult], actualWriter: BodyStreamWriter) {
+        self.eventLoop = eventLoop
+        self.rewrite = rewrite
+        self.actualWriter = actualWriter
+    }
+
+    func write(_ result: BodyStreamResult, promise: EventLoopPromise<Void>?) {
+        let newResults = rewrite(result)
+        let promises = newResults.map { self.actualWriter.write($0) }
+        let future = EventLoopFuture<Void>.whenAllSucceed(promises, on: eventLoop).map { _ in () }
+        if let promise { future.cascade(to: promise) }
     }
 }
